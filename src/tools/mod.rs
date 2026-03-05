@@ -4,7 +4,18 @@ use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+// ============================================================================
+// Validation constants
+// ============================================================================
+
+const MAX_NAME_LEN: usize = 200;
+const MAX_EMAIL_LEN: usize = 254; // RFC 5321
+const MAX_TEXT_LEN: usize = 5000;
+const MAX_STAGES: usize = 50;
+const MIN_LEAD_SCORE: i32 = 0;
+const MAX_LEAD_SCORE: i32 = 100;
 
 // ============================================================================
 // Data types
@@ -41,6 +52,46 @@ pub struct StageHistory {
     pub to_stage: String,
     pub notes: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+// ============================================================================
+// Validation helpers
+// ============================================================================
+
+fn validate_not_empty(value: &str, field: &str) -> Result<(), CallToolResult> {
+    if value.trim().is_empty() {
+        return Err(error_result(&format!("{field} cannot be empty")));
+    }
+    Ok(())
+}
+
+fn validate_max_len(value: &str, max: usize, field: &str) -> Result<(), CallToolResult> {
+    if value.len() > max {
+        return Err(error_result(&format!(
+            "{field} exceeds maximum length of {max} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_email(email: &str) -> Result<(), CallToolResult> {
+    let trimmed = email.trim();
+    if trimmed.is_empty() {
+        return Err(error_result("contact_email cannot be empty"));
+    }
+    if trimmed.len() > MAX_EMAIL_LEN {
+        return Err(error_result(&format!(
+            "contact_email exceeds maximum length of {MAX_EMAIL_LEN} characters"
+        )));
+    }
+    // Basic email format: must have exactly one @ with non-empty local and domain parts
+    let parts: Vec<&str> = trimmed.splitn(2, '@').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() || !parts[1].contains('.') {
+        return Err(error_result(
+            "contact_email must be a valid email address (e.g. user@example.com)",
+        ));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -212,6 +263,13 @@ impl PipelineMcpServer {
             None => return error_result("Missing required parameter: name"),
         };
 
+        if let Err(e) = validate_not_empty(&name, "name") {
+            return e;
+        }
+        if let Err(e) = validate_max_len(&name, MAX_NAME_LEN, "name") {
+            return e;
+        }
+
         let stages: Vec<String> = match args.get("stages").and_then(|v| v.as_array()) {
             Some(arr) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
             None => return error_result("Missing required parameter: stages (must be a JSON array of strings)"),
@@ -219,6 +277,32 @@ impl PipelineMcpServer {
 
         if stages.len() < 2 {
             return error_result("Pipeline must have at least 2 stages");
+        }
+
+        if stages.len() > MAX_STAGES {
+            return error_result(&format!("Pipeline cannot have more than {MAX_STAGES} stages"));
+        }
+
+        // Validate individual stage names
+        for (i, stage) in stages.iter().enumerate() {
+            if stage.trim().is_empty() {
+                return error_result(&format!("Stage at index {i} cannot be empty"));
+            }
+            if stage.len() > MAX_NAME_LEN {
+                return error_result(&format!(
+                    "Stage '{}' exceeds maximum length of {MAX_NAME_LEN} characters",
+                    &stage[..50]
+                ));
+            }
+        }
+
+        // Check for duplicate stage names
+        let mut seen = std::collections::HashSet::new();
+        for stage in &stages {
+            let lower = stage.to_lowercase();
+            if !seen.insert(lower) {
+                return error_result(&format!("Duplicate stage name: '{stage}'"));
+            }
         }
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -310,14 +394,35 @@ impl PipelineMcpServer {
             Some(n) => n,
             None => return error_result("Missing required parameter: pipeline_name"),
         };
+        if let Err(e) = validate_not_empty(&pipeline_name, "pipeline_name") {
+            return e;
+        }
+
         let contact_email = match get_str(args, "contact_email") {
             Some(e) => e,
             None => return error_result("Missing required parameter: contact_email"),
         };
+        if let Err(e) = validate_email(&contact_email) {
+            return e;
+        }
+
         let company = get_str(args, "company").unwrap_or_default();
+        if let Err(e) = validate_max_len(&company, MAX_TEXT_LEN, "company") {
+            return e;
+        }
+
         let source = get_str(args, "source").unwrap_or_default();
+        if let Err(e) = validate_max_len(&source, MAX_TEXT_LEN, "source") {
+            return e;
+        }
+
         let lead_score = get_i64(args, "lead_score").unwrap_or(0) as i32;
+        let lead_score = lead_score.clamp(MIN_LEAD_SCORE, MAX_LEAD_SCORE);
+
         let notes = get_str(args, "notes").unwrap_or_default();
+        if let Err(e) = validate_max_len(&notes, MAX_TEXT_LEN, "notes") {
+            return e;
+        }
 
         // Look up pipeline
         let pipeline: Option<Pipeline> = match sqlx::query_as(
@@ -361,14 +466,17 @@ impl PipelineMcpServer {
             Ok(prospect) => {
                 // Record initial stage entry in history
                 let hist_id = uuid::Uuid::new_v4().to_string();
-                let _ = sqlx::query(
+                if let Err(e) = sqlx::query(
                     "INSERT INTO pipeline.stage_history (id, prospect_id, from_stage, to_stage, notes) VALUES ($1, $2, '', $3, 'Initial entry')",
                 )
                 .bind(&hist_id)
                 .bind(&id)
                 .bind(&first_stage)
                 .execute(self.db.pool())
-                .await;
+                .await
+                {
+                    warn!(error = %e, prospect_id = id, "Failed to record initial stage history");
+                }
 
                 info!(email = contact_email, pipeline = pipeline_name, "Added prospect");
                 json_result(&prospect)
@@ -382,11 +490,19 @@ impl PipelineMcpServer {
             Some(e) => e,
             None => return error_result("Missing required parameter: contact_email"),
         };
+        if let Err(e) = validate_email(&contact_email) {
+            return e;
+        }
+
         let score_delta = match get_i64(args, "score_delta") {
             Some(d) => d as i32,
             None => return error_result("Missing required parameter: score_delta"),
         };
+
         let reason = get_str(args, "reason").unwrap_or_default();
+        if let Err(e) = validate_max_len(&reason, MAX_TEXT_LEN, "reason") {
+            return e;
+        }
 
         // Clamp score between 0 and 100
         match sqlx::query_as::<_, Prospect>(
@@ -415,11 +531,22 @@ impl PipelineMcpServer {
             Some(e) => e,
             None => return error_result("Missing required parameter: contact_email"),
         };
+        if let Err(e) = validate_email(&contact_email) {
+            return e;
+        }
+
         let to_stage = match get_str(args, "to_stage") {
             Some(s) => s,
             None => return error_result("Missing required parameter: to_stage"),
         };
+        if let Err(e) = validate_not_empty(&to_stage, "to_stage") {
+            return e;
+        }
+
         let notes = get_str(args, "notes").unwrap_or_default();
+        if let Err(e) = validate_max_len(&notes, MAX_TEXT_LEN, "notes") {
+            return e;
+        }
 
         // Fetch prospect with pipeline
         let prospect: Option<Prospect> = match sqlx::query_as(
@@ -438,15 +565,26 @@ impl PipelineMcpServer {
             None => return error_result(&format!("Prospect with email '{contact_email}' not found")),
         };
 
+        // Reject no-op stage transitions
+        if prospect.current_stage == to_stage {
+            return error_result(&format!(
+                "Prospect is already in stage '{to_stage}'"
+            ));
+        }
+
         // Validate target stage exists in pipeline
         let pipeline: Pipeline = match sqlx::query_as(
             "SELECT * FROM pipeline.pipelines WHERE id = $1",
         )
         .bind(&prospect.pipeline_id)
-        .fetch_one(self.db.pool())
+        .fetch_optional(self.db.pool())
         .await
         {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
+            Ok(None) => return error_result(&format!(
+                "Pipeline '{}' referenced by prospect no longer exists",
+                prospect.pipeline_id
+            )),
             Err(e) => return error_result(&format!("Database error: {e}")),
         };
 
@@ -477,7 +615,7 @@ impl PipelineMcpServer {
             Ok(updated) => {
                 // Record stage transition
                 let hist_id = uuid::Uuid::new_v4().to_string();
-                let _ = sqlx::query(
+                if let Err(e) = sqlx::query(
                     "INSERT INTO pipeline.stage_history (id, prospect_id, from_stage, to_stage, notes) VALUES ($1, $2, $3, $4, $5)",
                 )
                 .bind(&hist_id)
@@ -486,7 +624,10 @@ impl PipelineMcpServer {
                 .bind(&to_stage)
                 .bind(&notes)
                 .execute(self.db.pool())
-                .await;
+                .await
+                {
+                    warn!(error = %e, prospect_id = prospect.id, "Failed to record stage history");
+                }
 
                 info!(email = contact_email, from = from_stage, to = to_stage, "Advanced prospect");
                 json_result(&serde_json::json!({
@@ -643,6 +784,10 @@ impl PipelineMcpServer {
     }
 
     async fn handle_stale_deals(&self, pipeline_name: &str, threshold_days: i64) -> CallToolResult {
+        if threshold_days < 1 {
+            return error_result("threshold_days must be at least 1");
+        }
+
         // Fetch pipeline
         let pipeline: Option<Pipeline> = match sqlx::query_as(
             "SELECT * FROM pipeline.pipelines WHERE name = $1",

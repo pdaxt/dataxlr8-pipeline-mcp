@@ -19,7 +19,7 @@ pub async fn setup_schema(pool: &PgPool) -> Result<()> {
             contact_email   TEXT NOT NULL,
             company         TEXT NOT NULL DEFAULT '',
             current_stage   TEXT NOT NULL,
-            lead_score      INTEGER NOT NULL DEFAULT 0,
+            lead_score      INTEGER NOT NULL DEFAULT 0 CHECK (lead_score >= 0 AND lead_score <= 100),
             source          TEXT NOT NULL DEFAULT '',
             notes           TEXT NOT NULL DEFAULT '',
             entered_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -39,6 +39,8 @@ pub async fn setup_schema(pool: &PgPool) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_prospects_pipeline_id ON pipeline.prospects(pipeline_id);
         CREATE INDEX IF NOT EXISTS idx_prospects_current_stage ON pipeline.prospects(current_stage);
         CREATE INDEX IF NOT EXISTS idx_prospects_contact_email ON pipeline.prospects(contact_email);
+        CREATE INDEX IF NOT EXISTS idx_prospects_last_activity ON pipeline.prospects(last_activity);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_prospects_pipeline_email ON pipeline.prospects(pipeline_id, contact_email);
         CREATE INDEX IF NOT EXISTS idx_stage_history_prospect_id ON pipeline.stage_history(prospect_id);
         "#,
     )
