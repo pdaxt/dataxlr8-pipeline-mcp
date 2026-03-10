@@ -5,6 +5,10 @@ edition = "2024"
 description = "Sales pipeline automation MCP server for DataXLR8 platform"
 repository = "https://github.com/pdaxt/dataxlr8-pipeline-mcp"
 
+
+[lib]
+name = "dataxlr8_pipeline_mcp"
+path = "src/lib.rs"
 [dependencies]
 # MCP SDK
 rmcp = { version = "0.17", features = ["server", "transport-io"] }
